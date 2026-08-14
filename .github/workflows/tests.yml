@@ -1,0 +1,99 @@
+name: Unwind tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: NASM ${{ matrix.version }}
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 2.16.01
+            sha256: 029EED31FAF0D2C5F95783294432CBEA6C15BF633430F254BB3C1F195C67CA3A
+          - version: "3.01"
+            sha256: E0BA5157007ABC7B1A65118A96657A961DDF55F7E3F632EE035366DFCE039CA4
+          - version: "3.02"
+            sha256: 161D0BFAFF53C2F9E9F3E69FD0672323EBABAFD1268976A5CEC11BE92A19AEE7
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch NASM
+        shell: pwsh
+        run: |
+          $version = '${{ matrix.version }}'
+          $archive = Join-Path $env:RUNNER_TEMP "nasm-$version-win64.zip"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/$version/win64/nasm-$version-win64.zip"
+          Invoke-WebRequest $url -OutFile $archive
+
+          $actualHash = (Get-FileHash $archive -Algorithm SHA256).Hash
+          if ($actualHash -ne '${{ matrix.sha256 }}') {
+              throw "NASM archive hash mismatch: $actualHash"
+          }
+
+          $toolRoot = Join-Path $env:RUNNER_TEMP "nasm-$version"
+          Expand-Archive $archive -DestinationPath $toolRoot
+          $nasm = Get-ChildItem $toolRoot -Recurse -Filter nasm.exe |
+              Select-Object -First 1 -ExpandProperty FullName
+          if (-not $nasm) {
+              throw 'nasm.exe is missing from the archive'
+          }
+
+          "NASM_EXE=$nasm" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Run unwind tests
+        shell: pwsh
+        run: .\tests\run.ps1 -Nasm $env:NASM_EXE
+
+  nasm-master:
+    name: NASM master
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch NASM master
+        shell: bash
+        run: |
+          source="$RUNNER_TEMP/nasm-master"
+          git clone --depth 1 https://github.com/netwide-assembler/nasm.git "$source"
+          commit=$(git -C "$source" rev-parse HEAD)
+          echo "NASM_SOURCE=$source" >> "$GITHUB_ENV"
+          echo "NASM master: $commit" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build NASM master
+        shell: bash
+        run: |
+          cd "$NASM_SOURCE"
+          sh autogen.sh
+          sh configure
+          make -j2
+          ./nasm -v
+          echo "NASM_EXE=$NASM_SOURCE/nasm" >> "$GITHUB_ENV"
+
+      - name: Run extended unwind tests
+        shell: pwsh
+        run: |
+          $readObj = Get-Command 'llvm-readobj*' -CommandType Application -ErrorAction SilentlyContinue |
+              Where-Object Name -Match '^llvm-readobj(?:-[0-9]+)?$' |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+          if (-not $readObj) {
+              throw 'llvm-readobj was not found on the runner'
+          }
+          $seed = [int](Get-Date -AsUTC -Format yyyyMMdd)
+          "Random seed: $seed" | Add-Content $env:GITHUB_STEP_SUMMARY
+          ./tests/run.ps1 -Nasm $env:NASM_EXE -LlvmReadObj $readObj.Source `
+              -RandomCases 10000 -RandomSeed $seed -StaticOnly
